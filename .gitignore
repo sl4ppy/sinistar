@@ -3,7 +3,11 @@ sinistar
 *.o
 
 # ROM files (copyrighted, not distributable)
-source/
+source/*
+!source/.gitkeep
+!source/speech/
+source/speech/*
+!source/speech/.gitkeep
 
 # Screenshots
 *.png
