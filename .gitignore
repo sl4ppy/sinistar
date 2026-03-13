@@ -1,6 +1,14 @@
 # Build artifacts
 sinistar
+sinistar.exe
+extract_assets
+extract_assets.exe
 *.o
+*.dll
+*.pdb
+build/
+build_tool/
+Release/
 
 # ROM files (copyrighted, not distributable)
 source/*
@@ -9,14 +17,18 @@ source/*
 source/speech/*
 !source/speech/.gitkeep
 
-# Screenshots
-*.png
-*.ppm
+# Screenshots (in project root)
+/*.png
+/*.ppm
 
 # Editor/IDE
 .vscode/
 *.swp
 *~
+
+# Temp files
+*.ps1
+*.mp4
 
 # Claude Code
 .claude/

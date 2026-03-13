@@ -1,4 +1,5 @@
-// Sinistar Asset Extraction - Loads and extracts sprites, palette, speech from original ROMs
+// Sinistar Assets - Loads sprites from PNG sprite sheets and speech from WAV files
+// All assets loaded at runtime from assets/ directory - editable by developers
 #pragma once
 #include <SDL2/SDL.h>
 #include <cstdio>
@@ -7,9 +8,9 @@
 #include <vector>
 #include <cmath>
 
-static constexpr int ROM_SIZE = 0x1000;
-static constexpr int NUM_GAME_ROMS = 9;
-// Original Williams hardware: 304×256 framebuffer, CRT rotated 270° → portrait 256×304
+#include "stb_image.h"
+
+// Original Williams hardware: 304x256 framebuffer, CRT rotated 270 -> portrait 256x304
 static constexpr int SCR_W = 256;
 static constexpr int SCR_H = 304;
 
@@ -27,23 +28,7 @@ struct SpriteSet {
     int count() const { return (int)frames.size(); }
 };
 
-// Descriptor table addresses discovered from ROM analysis + original source code
-static constexpr uint16_t DESC_PLAYER   = 0x0007; static constexpr int DESC_PLAYER_N   = 32;
-static constexpr uint16_t DESC_WORKER   = 0x129D; static constexpr int DESC_WORKER_N   = 16;
-static constexpr uint16_t DESC_WARRIOR  = 0x19E1; static constexpr int DESC_WARRIOR_N  = 1;
-static constexpr uint16_t DESC_PLAN1    = 0x0B23; // 28x26
-static constexpr uint16_t DESC_PLAN2    = 0x0CCB; // 26x24
-static constexpr uint16_t DESC_PLAN3    = 0x0E3B; // 20x18
-static constexpr uint16_t DESC_PLAN4    = 0x0F1B; // 24x27
-static constexpr uint16_t DESC_PLAN5    = 0x109D; // 32x28
-static constexpr uint16_t DESC_SBOMB    = 0x0AD4; static constexpr int DESC_SBOMB_N    = 3;
-static constexpr uint16_t DESC_SHOT     = 0x2438; static constexpr int DESC_SHOT_N     = 16;
-static constexpr uint16_t DESC_CRYSTAL  = 0x26A1;
-
 struct Assets {
-    uint8_t romData[NUM_GAME_ROMS * ROM_SIZE]; // ROMs 01-09 concatenated (36KB overlay)
-    uint8_t speechROM[4 * ROM_SIZE];           // speech.ic4-ic7 (16KB)
-
     SpriteSet playerShip;  // 32 rotation frames
     SpriteSet workerShip;  // 16 rotation frames
     SpriteSet warrior;     // 1+ frames
@@ -51,11 +36,14 @@ struct Assets {
     SpriteSet sinibomb;    // 3 animation frames
     SpriteSet shots;       // shot frames
     Sprite crystal;
-    Sprite sinistarFace;   // procedural placeholder
+    Sprite sinistarFace;
+    SpriteSet sinistarPieces; // 11 individual face pieces for piece-by-piece rendering
 
     uint32_t palette[16] = {};
+    // Palette as separate R,G,B for color matching
+    uint8_t palR[16] = {}, palG[16] = {}, palB[16] = {};
 
-    // CVSD decoded speech (one big buffer, split into samples)
+    // Decoded speech (one big buffer, split into samples)
     std::vector<float> speechPCM;
     struct SpeechClip { int start, len; };
     std::vector<SpeechClip> speechClips;
@@ -69,33 +57,17 @@ struct Assets {
     int curSpeechClip = -1;
     int speechPos = 0;
 
-    bool load(const char* romDir) {
-        char path[512];
-        // Load game ROMs 01-09
-        for (int i = 0; i < NUM_GAME_ROMS; i++) {
-            snprintf(path, sizeof(path), "%s/sinistar.%02d", romDir, i + 1);
-            FILE* f = fopen(path, "rb");
-            if (!f) { fprintf(stderr, "Missing: %s\n", path); return false; }
-            if (fread(&romData[i * ROM_SIZE], 1, ROM_SIZE, f) != ROM_SIZE) {
-                fclose(f); return false;
-            }
-            fclose(f);
-        }
-        // Load speech ROMs (MAME order: ic7 at 0x0000, ic6, ic5, ic4 at 0x3000)
-        const char* sp[] = {"speech.ic7","speech.ic6","speech.ic5","speech.ic4"};
-        for (int i = 0; i < 4; i++) {
-            snprintf(path, sizeof(path), "%s/%s", romDir, sp[i]);
-            FILE* f = fopen(path, "rb");
-            if (f) { size_t n = fread(&speechROM[i * ROM_SIZE], 1, ROM_SIZE, f); (void)n; fclose(f); }
-        }
+    static constexpr int SPK_COUNT = 8;
+
+    bool load(const char* assetDir = "assets") {
         initPalette();
-        extractSprites();
-        loadSpeechWAVs(romDir);
+        if (!loadAllSprites(assetDir)) return false;
+        loadSpeechWAVs(assetDir);
         return true;
     }
 
     void initPalette() {
-        // From original source (SAMTABLE.ASM), format BBGGGRRR (octal)
+        // From original source (SAMTABLE.ASM), format BBGGGRRR
         // Bits 7-6=Blue(2), 5-3=Green(3), 2-0=Red(3)
         static const uint8_t pal[] = {
             0x00,0xFF,0xBF,0xAE,0xAD,0xA4,0x9A,0x00,
@@ -104,292 +76,123 @@ struct Assets {
         for (int i = 0; i < 16; i++) {
             uint8_t v = pal[i];
             int r3 = v & 7, g3 = (v >> 3) & 7, b2 = (v >> 6) & 3;
-            uint8_t r = (r3 << 5) | (r3 << 2) | (r3 >> 1);
-            uint8_t g = (g3 << 5) | (g3 << 2) | (g3 >> 1);
-            uint8_t b = (b2 << 6) | (b2 << 4) | (b2 << 2) | b2;
-            palette[i] = ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | 0xFF;
+            palR[i] = (r3 << 5) | (r3 << 2) | (r3 >> 1);
+            palG[i] = (g3 << 5) | (g3 << 2) | (g3 >> 1);
+            palB[i] = (b2 << 6) | (b2 << 4) | (b2 << 2) | b2;
+            palette[i] = ((uint32_t)palR[i] << 24) | ((uint32_t)palG[i] << 16) |
+                         ((uint32_t)palB[i] << 8) | 0xFF;
         }
     }
 
-    Sprite extractOne(uint16_t descAddr) {
-        Sprite s;
-        if (descAddr + 8 > (int)sizeof(romData)) return s;
-        int wb = romData[descAddr];     // width in bytes
-        int h  = romData[descAddr + 1]; // height in pixels
-        uint16_t dataAddr = (romData[descAddr + 2] << 8) | romData[descAddr + 3];
-        s.cx = romData[descAddr + 6];
-        s.cy = romData[descAddr + 7];
-        s.w = wb * 2;
-        s.h = h;
-        if (s.w == 0 || s.h == 0) return s;
-        s.pixels.resize(s.w * s.h, 0);
-        for (int row = 0; row < h; row++) {
-            for (int col = 0; col < wb; col++) {
-                uint16_t addr = dataAddr + row * wb + col;
-                if (addr >= sizeof(romData)) continue;
-                uint8_t byte = romData[addr];
-                int px = col * 2;
-                s.pixels[row * s.w + px]     = (byte >> 4) & 0x0F;
-                s.pixels[row * s.w + px + 1] = byte & 0x0F;
-            }
+    // Map an RGBA pixel to the nearest palette index (0 if transparent)
+    uint8_t matchColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) const {
+        if (a < 128) return 0; // transparent
+        int bestIdx = 1;
+        int bestDist = 999999;
+        for (int i = 1; i < 16; i++) {
+            int dr = (int)r - palR[i];
+            int dg = (int)g - palG[i];
+            int db = (int)b - palB[i];
+            int dist = dr*dr + dg*dg + db*db;
+            if (dist < bestDist) { bestDist = dist; bestIdx = i; }
         }
-        return s;
+        return (uint8_t)bestIdx;
     }
 
-    void extractSet(SpriteSet& set, uint16_t baseAddr, int count) {
-        set.frames.clear();
-        for (int i = 0; i < count; i++) {
-            set.frames.push_back(extractOne(baseAddr + i * 8));
+    // Load a sprite sheet PNG + metadata file
+    bool loadSpriteSheet(const char* pngPath, const char* metaPath, SpriteSet& set) {
+        // Read metadata
+        FILE* meta = fopen(metaPath, "r");
+        if (!meta) { fprintf(stderr, "Missing: %s\n", metaPath); return false; }
+
+        char line[256];
+        int nframes = 0, cellW = 0, cellH = 0;
+        // Skip comment lines, read header
+        while (fgets(line, sizeof(line), meta)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            if (sscanf(line, "%d %d %d", &nframes, &cellW, &cellH) == 3) break;
         }
-    }
-
-    void extractSprites() {
-        extractSet(playerShip, DESC_PLAYER, DESC_PLAYER_N);
-        extractSet(workerShip, DESC_WORKER, DESC_WORKER_N);
-        extractSet(warrior, DESC_WARRIOR, DESC_WARRIOR_N);
-        extractSet(sinibomb, DESC_SBOMB, DESC_SBOMB_N);
-        extractSet(shots, DESC_SHOT, DESC_SHOT_N);
-        for (int i = 0; i < 5; i++) {
-            static const uint16_t pa[] = {DESC_PLAN1,DESC_PLAN2,DESC_PLAN3,DESC_PLAN4,DESC_PLAN5};
-            planetoid[i] = extractOne(pa[i]);
+        struct FrameMeta { int w, h, cx, cy; };
+        std::vector<FrameMeta> frameMeta(nframes);
+        int fi = 0;
+        while (fi < nframes && fgets(line, sizeof(line), meta)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            sscanf(line, "%d %d %d %d", &frameMeta[fi].w, &frameMeta[fi].h,
+                   &frameMeta[fi].cx, &frameMeta[fi].cy);
+            fi++;
         }
-        crystal = extractOne(DESC_CRYSTAL);
-        makeSinistarFace();
-        printf("Extracted: %d player, %d worker, %d warrior, 5 planetoid, %d shot, %d sbomb, 1 crystal\n",
-               playerShip.count(), workerShip.count(), warrior.count(),
-               shots.count(), sinibomb.count());
-    }
+        fclose(meta);
 
-    void makeSinistarFace() {
-        // Authentic Sinistar face composited from original piece sprites (IMAGE.ASM)
-        // 49 columns x 52 pixels (26 bytes/col x 2 vertical pixels/byte)
-        static constexpr int FW = 49, FH = 52;
-        sinistarFace.w = FW; sinistarFace.h = FH;
-        sinistarFace.cx = 24; sinistarFace.cy = 26; // SINISCE=24, SINILCE=25 → screen_y=26
-        sinistarFace.pixels.resize(FW * FH, 0);
+        // Load PNG
+        int imgW, imgH, channels;
+        uint8_t* img = stbi_load(pngPath, &imgW, &imgH, &channels, 4);
+        if (!img) { fprintf(stderr, "Cannot load: %s\n", pngPath); return false; }
 
-        // Piece data from original IMAGE.ASM - column-major, each byte = 2 vertical pixels
-        // Format: {L, S, hBytes, wCols, data[wCols][hBytes]}
-        struct Piece { int L, S, hBytes, wCols; const uint8_t* data; };
+        // Extract frames
+        set.frames.resize(nframes);
+        for (int f = 0; f < nframes; f++) {
+            auto& fm = frameMeta[f];
+            auto& spr = set.frames[f];
+            spr.w = fm.w; spr.h = fm.h;
+            spr.cx = fm.cx; spr.cy = fm.cy;
+            spr.pixels.resize(fm.w * fm.h, 0);
 
-        // S1L: top-left skull border
-        static const uint8_t S1L_data[] = {
-            0x00,0x00,0x0A,0xA0,0x00,0x00,0x00, 0x00,0x00,0x0A,0xA0,0x00,0x00,0x00,
-            0x00,0x00,0xAA,0xAA,0x00,0x00,0x00, 0x00,0x00,0xA5,0xAB,0x00,0x00,0x00,
-            0x00,0x0A,0xA5,0x5A,0xB0,0x00,0x00, 0x65,0x5A,0xAB,0xBB,0xB0,0x00,0x00,
-            0xA6,0x64,0x43,0x45,0x5B,0xAA,0x00, 0x06,0x55,0x43,0x45,0x6B,0xAA,0x00,
-            0x00,0x65,0x53,0x45,0x5B,0xAA,0x00, 0x00,0x65,0x53,0x45,0x6B,0xAA,0x00,
-            0x00,0x56,0x54,0x55,0x5B,0xAA,0x00, 0x00,0x06,0x54,0x55,0x6B,0xAA,0x00,
-            0x00,0x0A,0xAB,0xBA,0xA0,0x00,0x00, 0x00,0x0A,0xAB,0xBB,0xA0,0x00,0x00,
-            0x00,0x0A,0x0B,0x0A,0x00,0x00,0x00,
-        };
-        // S2L: upper-left skull
-        static const uint8_t S2L_data[] = {
-            0xA0,0x00,0x00,0x00,0x05,0x30, 0xCC,0x00,0x00,0x05,0x43,0xA0,
-            0xCC,0xC0,0x05,0x44,0x45,0xA0, 0xDC,0xC4,0x34,0x44,0x4A,0x00,
-            0xD2,0x22,0x33,0x34,0x5A,0x00, 0x24,0x42,0x22,0x34,0xA0,0x00,
-            0x55,0x44,0x32,0x34,0x00,0x00, 0x65,0x54,0x42,0x30,0x00,0x00,
-            0x06,0x55,0x44,0x40,0x00,0x00, 0x00,0x65,0x54,0x00,0x00,0x00,
-            0x00,0x06,0x54,0x00,0x00,0x00,
-        };
-        // S3L: left skull mid
-        static const uint8_t S3L_data[] = {
-            0x00,0x0A,0xAA,0xAA,0x20,0x00,0x00,0x00,
-            0x00,0x06,0xBB,0xB2,0x40,0x00,0x00,0x00,
-            0x0A,0xA4,0x55,0x62,0x4A,0xBA,0x00,0x00,
-            0xAA,0xA3,0x46,0x23,0x4A,0x5B,0xBA,0x00,
-            0x0B,0xA3,0x44,0x23,0x46,0x55,0x5B,0x00,
-            0xBB,0xB2,0x42,0x33,0x4A,0x34,0x55,0x00,
-            0x0B,0xB3,0x52,0x33,0x4B,0x53,0x45,0x00,
-            0xBB,0xB5,0x33,0x44,0x5B,0x65,0x34,0x00,
-            0x0B,0xB5,0x34,0x44,0x5B,0xB6,0x55,0x00,
-            0xBB,0x53,0x44,0x55,0x50,0x5B,0x63,0x00,
-            0x0B,0x53,0x45,0x65,0x00,0x05,0x63,0x00,
-            0x0A,0x05,0x56,0x50,0x00,0x00,0x60,0x00,
-            0x00,0x00,0xA5,0x00,0x00,0x00,0x00,0x00,
-        };
-        // S4L: lower-left skull
-        static const uint8_t S4L_data[] = {
-            0x00,0x00,0xAA,0xAA,0xA0,0x00,0x00,
-            0x00,0x00,0x6B,0xBB,0xB0,0x00,0x00,
-            0x0A,0xBB,0x46,0x66,0x5A,0xA0,0x00,
-            0xB5,0x45,0x25,0x55,0x5A,0xAA,0x00,
-            0x53,0x32,0x23,0x43,0x3A,0xB0,0x00,
-            0x44,0x43,0x23,0x22,0x2B,0xBB,0x00,
-            0x45,0x43,0x12,0x33,0x3B,0xB0,0x00,
-            0x55,0x54,0x13,0x44,0x3B,0xBB,0x00,
-            0x55,0x55,0x14,0x35,0x5B,0xB0,0x00,
-            0x55,0x55,0x23,0x06,0x5B,0xB5,0x00,
-            0x45,0x56,0x50,0x00,0x6B,0xB0,0x00,
-            0x45,0x56,0x00,0x00,0x0A,0xA0,0x00,
-            0x34,0x60,0x00,0x00,0x00,0x00,0x00,
-        };
-        // S5L: lower-left base
-        static const uint8_t S5L_data[] = {
-            0x00,0x00,0x00,0x00,0x00,0x0C,0x00,
-            0x00,0x00,0x00,0x00,0x0C,0xCC,0x00,
-            0x00,0x00,0x00,0x00,0xCC,0xCC,0x00,
-            0x00,0x00,0x00,0x0C,0xCC,0xCC,0x00,
-            0x00,0x00,0x00,0xCC,0xCC,0xCD,0x00,
-            0x00,0x00,0x0B,0xCC,0xCC,0xDD,0x00,
-            0x00,0x00,0xBC,0xCC,0xCD,0xDD,0x00,
-            0x00,0xAB,0x35,0x54,0x33,0x33,0x00,
-            0x00,0xA6,0x45,0x43,0x32,0x32,0x00,
-            0x0A,0xB3,0x54,0x32,0x22,0x23,0x30,
-            0x0A,0x54,0x43,0x22,0x12,0x22,0x00,
-            0xAB,0x34,0x32,0x21,0x11,0x20,0x00,
-            0xAB,0x65,0x44,0x33,0x33,0x00,0x00,
-        };
-        // S6L: bottom-left
-        static const uint8_t S6L_data[] = {
-            0xA6,0x54,0x12,0x23,0x33,0x40,
-            0xA5,0x44,0x12,0x33,0x30,0x00,
-            0xA6,0x41,0x23,0x33,0x00,0x00,
-            0xA5,0x41,0x23,0x00,0x00,0x00,
-            0xA6,0x12,0x33,0x50,0x00,0x00,
-            0xA5,0x12,0x33,0x40,0x00,0x00,
-            0x00,0xAB,0xBB,0x00,0x00,0x00,
-            0x00,0xAB,0xBB,0x00,0x00,0x00,
-            0x00,0x0B,0x0B,0x00,0x00,0x00,
-        };
-        // JAWL: left jaw
-        static const uint8_t JAWL_data[] = {
-            0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x00,0x35,0x55,0x56,0x00,
-            0x00,0x00,0x00,0x03,0x42,0x22,0x22,0x00,
-            0x00,0x00,0x00,0x45,0x22,0x34,0x54,0x00,
-            0x00,0x00,0x05,0x52,0x23,0x34,0x50,0x00,
-            0x00,0x03,0x56,0x22,0x33,0x45,0x40,0x00,
-            0x00,0x35,0x65,0x33,0x34,0x5A,0x00,0x00,
-            0x33,0x55,0x63,0x33,0x52,0x00,0x00,0x00,
-        };
-        // CHEEKL: left cheek
-        static const uint8_t CHEEKL_data[] = {
-            0x00,0x00,0x20,0x00,0x00,0x00,
-            0x00,0x02,0x33,0x00,0x00,0x00,
-            0x00,0x23,0x44,0x40,0x02,0x00,
-            0x02,0x44,0x55,0x55,0x23,0x30,
-            0x24,0x45,0x66,0x63,0x33,0x00,
-            0x00,0x00,0x12,0x42,0x20,0x00,
-            0x00,0x00,0x23,0x32,0x00,0x00,
-            0x00,0x00,0x23,0x22,0x00,0x00,
-            0x00,0x04,0x33,0x22,0x00,0x00,
-            0x00,0x04,0x43,0x21,0x00,0x00,
-            0x00,0x05,0x54,0x42,0x00,0x00,
-            0x00,0x00,0x05,0x65,0x00,0x00,
-            0x00,0x00,0x00,0x55,0x00,0x00,
-        };
-        // CHIN: center chin
-        static const uint8_t CHIN_data[] = {
-            0x05,0x56,0x22,0x11,0x22,0x20,0x00,
-            0x05,0x56,0x52,0x22,0x23,0x35,0x00,
-            0xBA,0xAA,0x51,0x23,0x34,0x4A,0x00,
-            0xBB,0xBA,0x61,0x22,0x34,0x4A,0x00,
-            0xBA,0xAA,0x51,0x23,0x34,0x4A,0x00,
-            0x05,0x56,0x52,0x22,0x23,0x35,0x00,
-            0x05,0x56,0x22,0x11,0x22,0x20,0x00,
-        };
-        // EYEL: left eye
-        static const uint8_t EYEL_data[] = {
-            0x00,0x00,0x00,0x00,0x20,0x00,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x02,0x34,0x00,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x23,0x44,0x40,0x20,0x00,0x00,0x00,
-            0x00,0x00,0x02,0x23,0x55,0x61,0x22,0x00,0x00,0x00,
-            0x00,0x53,0x22,0x35,0x56,0x22,0x33,0x20,0x00,0x00,
-            0x05,0x54,0x44,0x45,0x52,0x23,0x33,0x43,0x00,0x00,
-            0x65,0x36,0xBB,0x35,0x22,0x33,0x33,0x44,0x34,0x00,
-            0x54,0x3B,0x0A,0xA2,0x23,0x33,0x44,0x30,0x00,0x00,
-            0x54,0x30,0x00,0x42,0x23,0x44,0x45,0x50,0x00,0x00,
-            0x44,0x3C,0x0A,0x21,0x34,0x45,0x54,0x45,0x00,0x00,
-            0x54,0x60,0x03,0x13,0x34,0x55,0x45,0x54,0x50,0x00,
-            0x55,0xA0,0x51,0x23,0x45,0x54,0x54,0x55,0x40,0x00,
-            0x56,0xA5,0x22,0x34,0x54,0x43,0x45,0x54,0x50,0x00,
-            0x00,0x02,0x23,0x45,0x42,0x34,0x55,0x55,0x54,0x00,
-            0x00,0x32,0x34,0x54,0x23,0x44,0x55,0x55,0x45,0x00,
-            0x00,0x23,0x45,0x56,0x66,0x55,0x55,0x55,0x54,0x00,
-            0x00,0x02,0x04,0x00,0x23,0x00,0x55,0x50,0x05,0x00,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x05,0x00,0x00,0x00,
-        };
-        // NEZ: nose (center)
-        static const uint8_t NEZ_data[] = {
-            0x00,0x30,0x00,0x00,0x00,0x00,
-            0x11,0x23,0x30,0x00,0x00,0x00,
-            0x02,0x34,0x44,0x00,0x00,0x00,
-            0x00,0x24,0x54,0x44,0x54,0x50,
-            0x0A,0x23,0x5A,0x05,0x45,0x00,
-            0x0A,0x23,0x45,0xA0,0xB5,0x00,
-            0x00,0x23,0x5A,0x05,0x45,0x00,
-            0x00,0x24,0x54,0x44,0x54,0x50,
-            0x02,0x34,0x44,0x00,0x00,0x00,
-            0x11,0x23,0x30,0x00,0x00,0x00,
-            0x00,0x30,0x00,0x00,0x00,0x00,
-        };
-
-        // L (left) pieces
-        static const Piece lPieces[] = {
-            {0x27, 0x0B, 7, 15, S1L_data},
-            {0x25, 0x04, 6, 11, S2L_data},
-            {0x17, 0x00, 8, 13, S3L_data},
-            {0x0E, 0x00, 7, 13, S4L_data},
-            {0x02, 0x04, 7, 13, S5L_data},
-            {0x00, 0x11, 6,  9, S6L_data},
-            {0x06, 0x0D, 8,  8, JAWL_data},
-            {0x10, 0x09, 6, 13, CHEEKL_data},
-            {0x06, 0x15, 7,  7, CHIN_data},
-            {0x18, 0x09,10, 18, EYEL_data},
-            {0x10, 0x13, 6, 11, NEZ_data},
-        };
-        // R (mirror) pieces - same data as L, reversed columns
-        // {lPieceIndex, rL, rS}
-        struct Mirror { int idx; int L, S; };
-        static const Mirror mirrors[] = {
-            {0, 0x27, 0x17}, // S1R
-            {1, 0x25, 0x22}, // S2R
-            {2, 0x17, 0x24}, // S3R
-            {3, 0x0E, 0x24}, // S4R
-            {4, 0x02, 0x20}, // S5R
-            {5, 0x00, 0x17}, // S6R
-            {6, 0x06, 0x1C}, // JAWR
-            {7, 0x10, 0x1B}, // CHEEKR
-            {9, 0x18, 0x16}, // EYER
-        };
-
-        // Composite a piece into the face buffer
-        auto placePiece = [&](const Piece& p, int L, int S, bool mirror) {
-            for (int col = 0; col < p.wCols; col++) {
-                int srcCol = mirror ? (p.wCols - 1 - col) : col;
-                int tx = S + col;
-                if (tx < 0 || tx >= FW) continue;
-                for (int b = 0; b < p.hBytes; b++) {
-                    uint8_t byte = p.data[srcCol * p.hBytes + b];
-                    uint8_t hi = (byte >> 4) & 0xF;
-                    uint8_t lo = byte & 0xF;
-                    // hi pixel at L + 2*b from bottom, lo at L + 2*b + 1
-                    int yHi = (FH - 1) - (L + 2 * b);
-                    int yLo = (FH - 1) - (L + 2 * b + 1);
-                    if (yHi >= 0 && yHi < FH && hi)
-                        sinistarFace.pixels[yHi * FW + tx] = hi;
-                    if (yLo >= 0 && yLo < FH && lo)
-                        sinistarFace.pixels[yLo * FW + tx] = lo;
+            int ox = f * cellW;
+            for (int y = 0; y < fm.h && y < cellH; y++) {
+                for (int x = 0; x < fm.w && x < cellW; x++) {
+                    int px = ox + x;
+                    if (px >= imgW || y >= imgH) continue;
+                    int pi = (y * imgW + px) * 4;
+                    spr.pixels[y * fm.w + x] = matchColor(img[pi], img[pi+1], img[pi+2], img[pi+3]);
                 }
             }
-        };
+        }
 
-        // Place all L pieces
-        for (const auto& p : lPieces)
-            placePiece(p, p.L, p.S, false);
-        // Place all R (mirror) pieces
-        for (const auto& m : mirrors)
-            placePiece(lPieces[m.idx], m.L, m.S, true);
+        stbi_image_free(img);
+        return true;
     }
 
-    // Speech clip IDs matching original Sinistar phrases
-    // 0: "Beware, I live!"    1: "I hunger"        2: "I am Sinistar"
-    // 3: "Run, coward!"      4: "Beware, coward!"  5: "I hunger, coward!"
-    // 6: "Run! Run! Run!"    7: Roar/growl (AARGH)
-    static constexpr int SPK_COUNT = 8;
+    bool loadAllSprites(const char* assetDir) {
+        char png[512], meta[512];
+        auto path = [&](const char* name, const char* ext) {
+            snprintf(png, sizeof(png), "%s/sprites/%s.png", assetDir, name);
+            snprintf(meta, sizeof(meta), "%s/sprites/%s.meta", assetDir, name);
+        };
 
-    void loadSpeechWAVs(const char* romDir) {
+        path("player", ""); if (!loadSpriteSheet(png, meta, playerShip)) return false;
+        path("worker", ""); if (!loadSpriteSheet(png, meta, workerShip)) return false;
+        path("warrior", ""); if (!loadSpriteSheet(png, meta, warrior)) return false;
+        path("sinibomb", ""); if (!loadSpriteSheet(png, meta, sinibomb)) return false;
+        path("shots", ""); if (!loadSpriteSheet(png, meta, shots)) return false;
+
+        // Planetoids: stored as a 5-frame sheet
+        SpriteSet planSet;
+        path("planetoid", "");
+        if (!loadSpriteSheet(png, meta, planSet)) return false;
+        for (int i = 0; i < 5 && i < planSet.count(); i++)
+            planetoid[i] = planSet.frames[i];
+
+        // Crystal and Sinistar face: single-frame sheets
+        SpriteSet crystalSet, faceSet;
+        path("crystal", ""); if (!loadSpriteSheet(png, meta, crystalSet)) return false;
+        if (crystalSet.count() > 0) crystal = crystalSet.frames[0];
+
+        path("sinistar_face", ""); if (!loadSpriteSheet(png, meta, faceSet)) return false;
+        if (faceSet.count() > 0) sinistarFace = faceSet.frames[0];
+
+        // Load individual Sinistar face pieces (optional - falls back to full face)
+        path("sinistar_pieces", "");
+        if (!loadSpriteSheet(png, meta, sinistarPieces)) {
+            printf("Note: sinistar_pieces not found, piece-by-piece rendering disabled\n");
+        }
+
+        printf("Loaded sprites: %d player, %d worker, %d warrior, 5 planetoid, %d shot, %d sbomb, 1 crystal, 1 face, %d pieces\n",
+               playerShip.count(), workerShip.count(), warrior.count(),
+               shots.count(), sinibomb.count(), sinistarPieces.count());
+        return true;
+    }
+
+    void loadSpeechWAVs(const char* assetDir) {
         static const char* wavFiles[SPK_COUNT] = {
             "speech/bewareil.wav", "speech/ihunger.wav", "speech/iamsinis.wav",
             "speech/runcowar.wav", "speech/bewareco.wav", "speech/ihungerc.wav",
@@ -401,7 +204,7 @@ struct Assets {
         int loaded = 0;
         for (int i = 0; i < SPK_COUNT; i++) {
             char path[512];
-            snprintf(path, sizeof(path), "%s/%s", romDir, wavFiles[i]);
+            snprintf(path, sizeof(path), "%s/%s", assetDir, wavFiles[i]);
             SDL_AudioSpec spec;
             uint8_t* buf = nullptr;
             uint32_t len = 0;
@@ -409,12 +212,10 @@ struct Assets {
                 fprintf(stderr, "Speech missing: %s (%s)\n", path, SDL_GetError());
                 continue;
             }
-            // Determine source sample count based on format
             int srcSamples = (int)len;
             bool is16bit = (spec.format == AUDIO_S16LSB || spec.format == AUDIO_S16MSB ||
                             spec.format == AUDIO_S16SYS);
             if (is16bit) srcSamples = (int)(len / 2);
-            // Resample to 44100Hz with linear interpolation
             float ratio = 44100.0f / (float)spec.freq;
             int dstSamples = (int)(srcSamples * ratio) + 1;
             int startIdx = (int)speechPCM.size();
@@ -430,7 +231,7 @@ struct Assets {
                 if (is16bit) {
                     v0 = ((int16_t*)buf)[s0] / 32768.0f;
                     v1 = ((int16_t*)buf)[s1] / 32768.0f;
-                } else { // AUDIO_U8
+                } else {
                     v0 = ((int)buf[s0] - 128) / 128.0f;
                     v1 = ((int)buf[s1] - 128) / 128.0f;
                 }
@@ -466,35 +267,19 @@ struct Assets {
     void playSound(int id) {
         SDL_LockMutex(audioMutex);
         switch (id) {
-            case 0: // Player fire - short punchy descending blip
-                playChannel(0, 2200, 0.14f, 0.9970f, 35, 0, 0.9980f);
-                break;
-            case 1: // Explosion - noise burst + low rumble
-                playChannel(1, 180, 0.22f, 0.9993f, 250, 1);
-                playChannel(7, 60, 0.15f, 0.9988f, 350, 2, 0.9990f);
-                break;
-            case 2: // Player death - descending sweep + long noise
-                playChannel(0, 800, 0.25f, 0.9994f, 500, 2, 0.9975f);
-                playChannel(1, 250, 0.25f, 0.9992f, 700, 1);
-                playChannel(7, 400, 0.18f, 0.9988f, 600, 0, 0.9960f);
-                break;
-            case 3: // Crystal pickup - quick ascending double chirp
-                playChannel(3, 1400, 0.10f, 0.9980f, 60, 0, 1.0040f);
-                break;
-            case 4: // Sinibomb launch - rising sweep + engine noise
-                playChannel(4, 150, 0.15f, 0.9994f, 400, 2, 1.0025f);
-                playChannel(5, 100, 0.10f, 0.9992f, 350, 1);
-                break;
-            case 5: // Sinistar hit - heavy impact + deep tone
-                playChannel(5, 80, 0.30f, 0.9990f, 400, 1);
-                playChannel(6, 50, 0.22f, 0.9992f, 500, 2, 0.9985f);
-                break;
-            case 6: // Warrior fire - shorter, higher-pitched blip
-                playChannel(6, 1600, 0.08f, 0.9965f, 40, 0, 0.9970f);
-                break;
-            case 7: // Bounce/ricochet - quick thud
-                playChannel(7, 400, 0.12f, 0.9975f, 80, 2, 0.9950f);
-                break;
+            case 0: playChannel(0, 2200, 0.14f, 0.9970f, 35, 0, 0.9980f); break;
+            case 1: playChannel(1, 180, 0.22f, 0.9993f, 250, 1);
+                    playChannel(7, 60, 0.15f, 0.9988f, 350, 2, 0.9990f); break;
+            case 2: playChannel(0, 800, 0.25f, 0.9994f, 500, 2, 0.9975f);
+                    playChannel(1, 250, 0.25f, 0.9992f, 700, 1);
+                    playChannel(7, 400, 0.18f, 0.9988f, 600, 0, 0.9960f); break;
+            case 3: playChannel(3, 1400, 0.10f, 0.9980f, 60, 0, 1.0040f); break;
+            case 4: playChannel(4, 150, 0.15f, 0.9994f, 400, 2, 1.0025f);
+                    playChannel(5, 100, 0.10f, 0.9992f, 350, 1); break;
+            case 5: playChannel(5, 80, 0.30f, 0.9990f, 400, 1);
+                    playChannel(6, 50, 0.22f, 0.9992f, 500, 2, 0.9985f); break;
+            case 6: playChannel(6, 1600, 0.08f, 0.9965f, 40, 0, 0.9970f); break;
+            case 7: playChannel(7, 400, 0.12f, 0.9975f, 80, 2, 0.9950f); break;
         }
         SDL_UnlockMutex(audioMutex);
     }
@@ -547,8 +332,7 @@ struct Assets {
     }
 };
 
-// Authentic Sinistar font - extracted from sinistar.otf recreation
-// 7x8 pixel glyphs, chunky Williams arcade style with thick 2-pixel strokes
+// Authentic Sinistar font - 7x8 pixel glyphs, chunky Williams arcade style
 static constexpr int FONT_W = 7;
 static constexpr int FONT_H = 8;
 static inline const uint8_t (*getSinistarFont())[8] {
@@ -561,7 +345,6 @@ static inline const uint8_t (*getSinistarFont())[8] {
             font[ch][0]=r0; font[ch][1]=r1; font[ch][2]=r2; font[ch][3]=r3;
             font[ch][4]=r4; font[ch][5]=r5; font[ch][6]=r6; font[ch][7]=r7;
         };
-        // Each row: 7 bits, bit6=leftmost pixel
         set(' ', 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
         set('!', 0x0C,0x0C,0x0C,0x04,0x04,0x00,0x0C,0x0C);
         set('.', 0x00,0x00,0x00,0x00,0x00,0x00,0x0C,0x0C);

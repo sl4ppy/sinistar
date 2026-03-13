@@ -44,6 +44,20 @@ static void drawSpriteCenter(const Sprite& spr, int sx, int sy) {
     drawSprite(spr, sx - spr.cx, sy - spr.cy);
 }
 
+static void drawSpriteMirrored(const Sprite& spr, int sx, int sy) {
+    for (int py = 0; py < spr.h; py++) {
+        int dy = sy + py;
+        if (dy < 0 || dy >= SCR_H) continue;
+        for (int px = 0; px < spr.w; px++) {
+            uint8_t c = spr.pixels[py * spr.w + (spr.w - 1 - px)];
+            if (c == 0) continue;
+            int dx = sx + px;
+            if (dx >= 0 && dx < SCR_W)
+                screenBuf[dy * SCR_W + dx] = assets.palette[c];
+        }
+    }
+}
+
 static void drawChar(char ch, int x, int y, uint32_t color) {
     if ((unsigned char)ch > 127) return;
     const uint8_t* glyph = SINISTAR_FONT[(unsigned char)ch];
@@ -157,6 +171,71 @@ static void drawStarfield() {
     }
 }
 
+// === SINISTAR PIECE-BY-PIECE RENDERING ===
+
+// Face dimensions (must match extract_assets.cpp makeSinistarFace)
+static constexpr int FACE_W = 49, FACE_H = 52;
+static constexpr int FACE_CX = 24, FACE_CY = 26;
+
+// Placement of each of the 11 pieces within the 49x52 face
+// faceX = S (column), faceY = FH - L - 2*hBytes (top row)
+// mirrorX = mirror S position (-1 = no mirror, center piece)
+struct PiecePlacement { int faceX, faceY, mirrorX; };
+static constexpr PiecePlacement piecePlacement[11] = {
+    {11, -1, 23},  // 0: S1L skull top      (faceY=-1: top row clips)
+    { 4,  3, 34},  // 1: S2L skull side
+    { 0, 13, 36},  // 2: S3L mouth frame
+    { 0, 24, 36},  // 3: S4L forehead
+    { 4, 36, 32},  // 4: S5L horn
+    {17, 40, 23},  // 5: S6L chin side
+    {13, 30, 28},  // 6: JAWL jaw
+    { 9, 24, 27},  // 7: CHEEKL cheek
+    {21, 32, -1},  // 8: CHIN center (no mirror)
+    { 9,  8, 22},  // 9: EYEL eye
+    {19, 24, -1},  // 10: NEZ nose (no mirror)
+};
+
+// Build order: maps sinistarPieces count (1-13) to draw operations
+// Each draw op: {pieceIndex, isMirror}
+struct SiniBuildOp { int pieceIdx; bool mirror; };
+static constexpr SiniBuildOp siniBuildOps[] = {
+    {4, false},             // pieces>=1: horn left
+    {4, true},              // pieces>=2: horn right
+    {3, false},             // pieces>=3: forehead left
+    {3, true},              // pieces>=4: forehead right
+    {2, false},             // pieces>=5: mouth frame left
+    {2, true},              // pieces>=6: mouth frame right
+    {0, false}, {0, true},  // pieces>=7: skull top L+R
+    {1, false}, {1, true},  // pieces>=8: skull side L+R
+    {5, false}, {5, true},  // pieces>=9: chin side L+R
+    {6, false}, {6, true},  // pieces>=10: jaw L+R
+    {7, false}, {7, true},  // pieces>=11: cheeks L+R
+    {9, false}, {9, true},  // pieces>=12: eyes L+R
+    {8, false}, {10,false}, // pieces>=13: chin + nose (center)
+};
+// Cumulative op count at each piece level
+static constexpr int siniOpsAtLevel[] = {
+    0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 20
+};
+
+static void drawSinistarPieces(int sx, int sy, int numPieces) {
+    if (assets.sinistarPieces.count() < 11) return;
+    int faceOX = sx - FACE_CX;
+    int faceOY = sy - FACE_CY;
+    int nOps = siniOpsAtLevel[std::min(numPieces, 13)];
+    for (int i = 0; i < nOps; i++) {
+        const auto& op = siniBuildOps[i];
+        const Sprite& spr = assets.sinistarPieces.frame(op.pieceIdx);
+        const auto& pl = piecePlacement[op.pieceIdx];
+        int px = faceOX + (op.mirror ? pl.mirrorX : pl.faceX);
+        int py = faceOY + pl.faceY;
+        if (op.mirror)
+            drawSpriteMirrored(spr, px, py);
+        else
+            drawSprite(spr, px, py);
+    }
+}
+
 // === GAMEPLAY ENTITY RENDERING ===
 
 static void drawEntities() {
@@ -216,7 +295,13 @@ static void drawEntities() {
                 }
                 break;
             case ENT_SINISTAR:
-                drawSpriteCenter(assets.sinistarFace, sx, sy);
+                if (game.sinistarPieces >= 13 || assets.sinistarPieces.count() < 11) {
+                    // Fully built or no piece sprites: draw complete face
+                    drawSpriteCenter(assets.sinistarFace, sx, sy);
+                } else if (game.sinistarPieces > 0) {
+                    // Partially built: draw individual pieces
+                    drawSinistarPieces(sx, sy, game.sinistarPieces);
+                }
                 if (game.sinistarPieces < 13) {
                     char buf[16]; snprintf(buf, sizeof(buf), "%d", game.sinistarPieces);
                     drawText(buf, sx - 4, sy - 28, assets.palette[15]);
@@ -294,8 +379,8 @@ static void drawHUD() {
         if (!e.active || e.type == ENT_BULLET_P || e.type == ENT_BULLET_W ||
             e.type == ENT_EXPLOSION || e.type == ENT_NONE) continue;
         Vec2 d = wrapDelta(pp, e.pos);
-        int rdx = rx + rw/2 + (int)(d.x / WORLD_W * rw * 4);
-        int rdy = ry + rh/2 + (int)(d.y / WORLD_H * rh * 4);
+        int rdx = rx + rw/2 + (int)(d.x / WORLD_W * rw * 2);
+        int rdy = ry + rh/2 + (int)(d.y / WORLD_H * rh * 2);
         if (rdx < rx+1 || rdx >= rx+rw-1 || rdy < ry+1 || rdy >= ry+rh-1) continue;
         uint32_t c = assets.palette[5];
         switch (e.type) {
@@ -396,11 +481,11 @@ static void renderAttractPoints() {
     drawTextCenter("POINT VALUES", 20, red);
 
     struct { const char* name; int pts; } entries[] = {
-        {"WORKER",          PTS_WORKER},
-        {"CRYSTAL",         PTS_CRYSTAL},
-        {"WARRIOR",         PTS_WARRIOR},
-        {"SINISTAR PIECE",  PTS_SINI_PIECE},
-        {"SINISTAR",        PTS_SINISTAR},
+        {"WORKER",          game.cfg.ptsWorker},
+        {"CRYSTAL",         game.cfg.ptsCrystal},
+        {"WARRIOR",         game.cfg.ptsWarrior},
+        {"SINISTAR PIECE",  game.cfg.ptsSiniPiece},
+        {"SINISTAR",        game.cfg.ptsSinistar},
     };
 
     for (int i = 0; i < 5; i++) {
@@ -474,15 +559,19 @@ static void renderStatus() {
         }
     }
 
-    // Sinistar face
-    drawSpriteCenter(assets.sinistarFace, SCR_W / 2, y + 30);
+    // Sinistar face (piece-by-piece on status screen)
+    if (game.sinistarPieces >= 13 || assets.sinistarPieces.count() < 11) {
+        drawSpriteCenter(assets.sinistarFace, SCR_W / 2, y + 30);
+    } else if (game.sinistarPieces > 0) {
+        drawSinistarPieces(SCR_W / 2, y + 30, game.sinistarPieces);
+    }
     y += 70;
 
     // Zone announcement
     char zbuf[48];
     snprintf(zbuf, sizeof(zbuf), "%s %s ZONE",
              game.justDestroyedSini ? "ENTERING" : "NOW IN",
-             ZONE_NAMES[game.zoneIndex()]);
+             game.cfg.zoneNames[game.zoneIndex()]);
     drawTextCenter(zbuf, y, white);
     y += 16;
 
@@ -578,10 +667,9 @@ static void renderGameplay() {
         memset(screenBuf, 0, sizeof(screenBuf));
     }
 
-    // Death flash (brief white screen)
+    // Death flash (very brief white overlay, then show explosion playing out)
     if (game.gameState == GS_DEATH && game.flashTimer > 0) {
         fillScreen(assets.palette[1]);
-        return; // pure white flash, no entities visible briefly
     }
 
     drawStarfield();
@@ -623,12 +711,12 @@ static void render() {
 
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
-    const char* romDir = "source";
+    const char* assetDir = "assets";
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-roms") == 0 && i + 1 < argc) romDir = argv[++i];
+        if (strcmp(argv[i], "-assets") == 0 && i + 1 < argc) assetDir = argv[++i];
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Sinistar - Native reimplementation using original ROM assets\n");
-            printf("Usage: %s [-roms <dir>]\n", argv[0]);
+            printf("Sinistar - Native reimplementation\n");
+            printf("Usage: %s [-assets <dir>]\n", argv[0]);
             printf("\nControls:\n  Arrow keys / WASD - Move\n  Space - Fire\n");
             printf("  B - Sinibomb\n  5 - Insert coin\n  1 - Start\n  Escape - Quit\n");
             return 0;
@@ -654,13 +742,20 @@ int main(int argc, char* argv[]) {
     SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA8888,
         SDL_TEXTUREACCESS_STREAMING, SCR_W, SCR_H);
 
-    printf("Loading ROMs from: %s/\n", romDir);
-    if (!assets.load(romDir)) {
-        fprintf(stderr, "Failed to load ROMs from %s/\n", romDir);
+    printf("Loading assets from: %s/\n", assetDir);
+    if (!assets.load(assetDir)) {
+        fprintf(stderr, "Failed to load assets from %s/\n", assetDir);
         SDL_DestroyTexture(tex); SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win); SDL_Quit(); return 1;
     }
     assets.initAudio();
+
+    // Load config files (optional — uses built-in defaults if missing)
+    char cfgPath[512];
+    snprintf(cfgPath, sizeof(cfgPath), "%s/config/game.cfg", assetDir);
+    loadGameConfig(game.cfg, cfgPath);
+    snprintf(cfgPath, sizeof(cfgPath), "%s/config/zones.cfg", assetDir);
+    loadZoneConfig(game.cfg, cfgPath);
 
     game.init();
 

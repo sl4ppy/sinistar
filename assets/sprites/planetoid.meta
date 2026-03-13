@@ -1,0 +1,9 @@
+# Sinistar sprite sheet metadata
+# nframes cellw cellh
+5 32 28
+# per-frame: w h cx cy
+28 26 13 13
+26 24 12 12
+20 18 9 9
+24 27 11 13
+32 28 15 14

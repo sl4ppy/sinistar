@@ -5,9 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include "config.h"
 
-static constexpr float WORLD_W = 8192.0f;
-static constexpr float WORLD_H = 8192.0f;
+static constexpr float WORLD_W = 1024.0f;
+static constexpr float WORLD_H = 1024.0f;
 static constexpr float PI = 3.14159265f;
 static constexpr float TAU = 2.0f * PI;
 static constexpr int MAX_ENTS = 256;
@@ -83,44 +84,6 @@ struct Entity {
 
 struct Star { Vec2 pos; int color; int layer; };
 
-struct ZoneParams {
-    int planetoids, warriors, workers;
-    int crystalsPerRock;
-    float warSpeed, wkrSpeed, siniSpeed;
-    int siniStartPieces;
-};
-static const ZoneParams ZONE_DATA[4] = {
-    { 20,   7,  20,  15,  120.f, 120.f, 200.f,  0 }, // Worker Zone
-    { 20,  15,  12,  12,  150.f, 130.f, 250.f,  3 }, // Warrior Zone
-    { 18,  12,  15,  10,  140.f, 140.f, 270.f,  5 }, // Planetoid Zone
-    { 12,  20,  18,   8,  170.f, 150.f, 300.f,  7 }, // Void Zone
-};
-
-static const char* ZONE_NAMES[] = {"WORKER","WARRIOR","PLANETOID","VOID"};
-
-// Point values from ROM (BCD values at ROM06: $0150, $0200, $0500, $7000+$8000)
-static constexpr int PTS_WORKER = 150;
-static constexpr int PTS_CRYSTAL = 200;
-static constexpr int PTS_WARRIOR = 500;
-static constexpr int PTS_SINI_PIECE = 500;
-static constexpr int PTS_SINISTAR = 15000; // $7000+$8000 from ROM
-
-struct SpeedEntry { float distThresh, maxSpeed; int shift; };
-
-static const SpeedEntry STBL_CHASE[] = {
-    {4096.f, 480.f, 5}, {2048.f, 280.f, 5}, {1024.f, 200.f, 4},
-    {512.f,  150.f, 4}, {256.f,  130.f, 3}, {128.f,  120.f, 3},
-    {64.f,   100.f, 2}, {32.f,    80.f, 2}, {0.f,     25.f, 2},
-};
-static constexpr int STBL_CHASE_N = 9;
-
-static const SpeedEntry STBL_ORBIT[] = {
-    {4096.f, 800.f, 5}, {2048.f, 500.f, 5}, {1024.f, 350.f, 4},
-    {512.f,  200.f, 4}, {256.f,  120.f, 3}, {128.f,   60.f, 3},
-    {64.f,    30.f, 2}, {32.f,    10.f, 2}, {16.f,     0.f, 1}, {0.f, 0.f, 1},
-};
-static constexpr int STBL_ORBIT_N = 10;
-
 static float siniAxisVel(float vel, float delta, const SpeedEntry* tbl, int n, float dm) {
     float dist = fabsf(delta);
     float maxSpd = tbl[n-1].maxSpeed;
@@ -140,12 +103,14 @@ struct InputState {
 };
 
 struct Game {
+    GameConfig cfg;
     Entity ents[MAX_ENTS];
     Star stars[NUM_STARS];
     Vec2 camera;
 
     // Scoring
     int score = 0;
+    int nextFreeLife;
     HighScoreEntry highScores[NUM_HIGH_SCORES];
 
     // Player state
@@ -156,6 +121,7 @@ struct Game {
 
     // Sinistar state
     int sinistarPieces = 0;
+    int siniDeliveries = 0;  // crystal deliveries toward next piece (ROM build threshold system)
     int siniInhibitor = 12;
     int siniStun = 0;
     float siniThinkAccum = 0;
@@ -196,10 +162,20 @@ struct Game {
     float flashTimer = 0;
 
     Entity& player() { return ents[0]; }
-    const ZoneParams& zone() const { return ZONE_DATA[(wave - 1) % 4]; }
+    const ZoneParams& zone() const { return cfg.zones[(wave - 1) % 4]; }
     int zoneCycle() const { return (wave - 1) / 4; }
-    float diffMul() const { return 1.0f + zoneCycle() * 0.15f; }
+    float diffMul() const { return 1.0f + zoneCycle() * cfg.diffScalePerCycle; }
     int zoneIndex() const { return (wave - 1) % 4; }
+
+    // Award points with free life check (original awards at 20K, then every 25K)
+    void addScore(int pts) {
+        score += pts;
+        while (score >= nextFreeLife) {
+            lives++;
+            soundTrigger = 3; // chime for extra life
+            nextFreeLife += cfg.freeLifeEvery;
+        }
+    }
 
     int topScore() const {
         int best = 0;
@@ -248,9 +224,10 @@ struct Game {
         for (auto& e : ents) e = Entity{};
         initHighScores();
         score = 0; lives = 3; sinibombs = 0;
+        nextFreeLife = cfg.freeLifeFirst;
         wave = 1; sinistarPieces = 0; sinistarKills = 0;
         gameState = GS_ATTRACT_TITLE;
-        stateTimer = 7.5f; // 448 frames
+        stateTimer = cfg.attractTitleTime;
         tipIndex = 0; tipTimer = 2.5f;
         fireCD = 0; bombCD = 0; credits = 0;
         message = nullptr; messageTimer = 0;
@@ -270,14 +247,15 @@ struct Game {
     void startGame() {
         for (auto& e : ents) e = Entity{};
         score = 0; lives = 3; sinibombs = 0;
-        sinistarPieces = 0; wave = 1; sinistarKills = 0;
+        nextFreeLife = cfg.freeLifeFirst;
+        sinistarPieces = 0; siniDeliveries = 0; wave = 1; sinistarKills = 0;
         fireCD = 0; bombCD = 0;
         justDestroyedSini = false;
         sinistarSpeechTimer = 0;
         spawnWave();
         // Go to STATUS screen (TURNINI)
         gameState = GS_STATUS;
-        stateTimer = 4.0f;
+        stateTimer = cfg.statusTime;
         soundTrigger = -1; speechTrigger = -1;
     }
 
@@ -291,7 +269,7 @@ struct Game {
         if (sini) {
             for (int t = 0; t < 20; t++) {
                 p.pos = randomPos();
-                if (wrapDist(p.pos, sini->pos) > 500) break;
+                if (wrapDist(p.pos, sini->pos) > 350) break;
             }
         }
         p.vel = {0,0}; p.angle = 0; p.radius = 5; p.health = 1;
@@ -314,7 +292,7 @@ struct Game {
             e.radius = sizes[e.subtype];
         }
         int numWarr = (int)(z.warriors * dm);
-        if (numWarr > 25) numWarr = 25;
+        if (numWarr > cfg.maxWarriors) numWarr = cfg.maxWarriors;
         for (int i = 0; i < numWarr; i++) spawnEnemy(ENT_WARRIOR);
         int numWork = z.workers;
         for (int i = 0; i < numWork; i++) spawnEnemy(ENT_WORKER);
@@ -326,7 +304,8 @@ struct Game {
             e.radius = 24; e.health = 13; e.state = 0;
             sinistarPieces = z.siniStartPieces + zoneCycle();
             if (sinistarPieces > 12) sinistarPieces = 12;
-            siniInhibitor = 12; siniStun = 0;
+            siniDeliveries = 0;
+            siniInhibitor = cfg.inhibitorTicks; siniStun = 0;
             siniThinkAccum = 0;
             siniOrbitDir = (rand() % 2) ? 1.0f : -1.0f;
         }
@@ -339,7 +318,7 @@ struct Game {
         Vec2 pp = player().pos;
         for (int t = 0; t < 10; t++) {
             e.pos = randomPos();
-            if (wrapDist(e.pos, pp) > 400) break;
+            if (wrapDist(e.pos, pp) > 300) break;
         }
         e.vel = {0,0}; e.angle = (float)(rand() % 628) / 100.0f;
         e.health = 1; e.state = 0; e.timer = 0;
@@ -416,15 +395,15 @@ struct Game {
             switch (gameState) {
             case GS_ATTRACT_TITLE:
                 gameState = GS_ATTRACT_HSTD;
-                stateTimer = 5.0f; // 300 frames
+                stateTimer = cfg.attractHstdTime;
                 break;
             case GS_ATTRACT_HSTD:
                 gameState = GS_ATTRACT_POINTS;
-                stateTimer = 7.0f; // 420 frames
+                stateTimer = cfg.attractPointsTime;
                 break;
             case GS_ATTRACT_POINTS:
                 gameState = GS_ATTRACT_TITLE;
-                stateTimer = 7.5f; // 448 frames
+                stateTimer = cfg.attractTitleTime;
                 tipIndex = 0; tipTimer = 2.5f;
                 break;
             default: break;
@@ -469,10 +448,10 @@ struct Game {
         if (stateTimer <= 0) {
             if (lives > 0) {
                 gameState = GS_STATUS;
-                stateTimer = 4.0f; // 240 frames
+                stateTimer = cfg.statusTime;
             } else {
                 gameState = GS_GAMEOVER;
-                stateTimer = 5.0f; // 300 frames from ROM
+                stateTimer = cfg.gameoverTime;
             }
         }
     }
@@ -500,9 +479,9 @@ struct Game {
                 hstdTimeout = 30.0f;
                 hstdInputCD = 0.5f;
             } else {
-                // No high score - return to attract after 4s delay (from ROM: 240 frames)
+                // No high score - return to attract
                 gameState = GS_ATTRACT_TITLE;
-                stateTimer = 7.5f;
+                stateTimer = cfg.attractTitleTime;
                 tipIndex = 0; tipTimer = 2.5f;
             }
         }
@@ -559,7 +538,7 @@ struct Game {
             for (int i = 1; i < MAX_ENTS; i++) ents[i] = Entity{};
             spawnWave();
             gameState = GS_STATUS;
-            stateTimer = 4.0f;
+            stateTimer = cfg.statusTime;
         }
     }
 
@@ -597,14 +576,13 @@ struct Game {
         if (jlen > 0.15f) {
             playerAngle = atan2f(-jy, jx);
             if (playerAngle < 0) playerAngle += TAU;
-            float thrust = 800.0f * jlen;
-            p.vel.x += cosf(playerAngle) * thrust * dt;
-            p.vel.y += sinf(playerAngle) * thrust * dt;
+            float thr = cfg.thrust * jlen;
+            p.vel.x += cosf(playerAngle) * thr * dt;
+            p.vel.y += sinf(playerAngle) * thr * dt;
         }
         float speed = p.vel.len();
-        float maxSpeed = 250.0f;
-        if (speed > maxSpeed) p.vel = p.vel * (maxSpeed / speed);
-        p.vel = p.vel * (1.0f - 1.5f * dt);
+        if (speed > cfg.maxSpeed) p.vel = p.vel * (cfg.maxSpeed / speed);
+        p.vel = p.vel * (1.0f - cfg.playerDrag * dt);
         p.angle = playerAngle;
         if (input.fire && fireCD <= 0) {
             int bi = findFree();
@@ -612,11 +590,10 @@ struct Game {
                 auto& b = ents[bi];
                 b.active = true; b.type = ENT_BULLET_P;
                 b.pos = p.pos + Vec2{cosf(playerAngle)*10, sinf(playerAngle)*10};
-                float bspeed = 500.0f;
-                b.vel = Vec2{cosf(playerAngle)*bspeed, sinf(playerAngle)*bspeed} + p.vel * 0.3f;
+                b.vel = Vec2{cosf(playerAngle)*cfg.bulletSpeed, sinf(playerAngle)*cfg.bulletSpeed} + p.vel * 0.3f;
                 b.timer = 1.2f; b.radius = 3; b.health = 1;
                 b.angle = playerAngle;
-                fireCD = 0.12f;
+                fireCD = cfg.fireCD;
                 soundTrigger = 0;
             }
         }
@@ -628,10 +605,10 @@ struct Game {
                     auto& b = ents[bi];
                     b.active = true; b.type = ENT_SINIBOMB;
                     b.pos = p.pos;
-                    b.vel = wrapDelta(p.pos, sini->pos).norm() * 350.0f;
+                    b.vel = wrapDelta(p.pos, sini->pos).norm() * cfg.sinibombSpeed;
                     b.timer = 5.0f; b.radius = 4; b.health = 1;
                     sinibombs--;
-                    bombCD = 0.5f;
+                    bombCD = cfg.bombCD;
                     soundTrigger = 4;
                 }
             }
@@ -640,8 +617,15 @@ struct Game {
 
     void updateWarrior(Entity& e, float dt) {
         float speed = zone().warSpeed * diffMul();
-        if (speed > 300.0f) speed = 300.0f;
+        if (speed > cfg.warMaxSpeed) speed = cfg.warMaxSpeed;
         float playerDist = wrapDist(e.pos, player().pos);
+        float aggr = std::min(1.0f, zone().aggression + zoneCycle() * cfg.aggrScalePerCycle);
+
+        // Aggro distance scales with aggression
+        float aggroDist = cfg.aggroDistBase + aggr * cfg.aggroDistScale;
+        // Fire cooldown scales with aggression
+        float fireCD_base = cfg.fireCDBase - aggr * cfg.fireCDAggrScale;
+        float fireCD_rand = cfg.fireCDRand;
 
         e.timer2 -= dt;
         if (e.timer2 <= 0) {
@@ -649,14 +633,16 @@ struct Game {
             Entity* sini = findType(ENT_SINISTAR);
             bool siniComplete = sini && sini->state == 1;
             if (siniComplete) {
-                e.state = 1;
+                e.state = 1; // all warriors chase when Sinistar is active
             } else {
+                // Chase probability scales with aggression: 10-50%
+                int chaseChance = (int)(1 + aggr * 4); // 1-5 out of 10
                 int r = rand() % 10;
-                if (r < 5) e.state = 1;
-                else if (r < 8) e.state = 2;
-                else e.state = 3;
+                if (r < chaseChance) e.state = 1;       // chase player
+                else if (r < chaseChance + 4) e.state = 2; // mine planetoids
+                else e.state = 3;                          // orbit sinistar
             }
-            if (playerDist < 200.0f) e.state = 1;
+            if (playerDist < aggroDist * 0.5f) e.state = 1; // forced chase only when very close
         }
 
         e.timer -= dt;
@@ -665,7 +651,7 @@ struct Game {
         case 0:
             e.vel = e.vel * (1.0f - 1.0f * dt);
             e.angle += 0.5f * dt;
-            if (playerDist < 400.0f) e.state = 1;
+            if (playerDist < aggroDist) e.state = 1;
             break;
 
         case 1: {
@@ -676,17 +662,18 @@ struct Game {
             if (sp > speed) e.vel = e.vel * (speed / sp);
             e.angle = atan2f(dir.y, dir.x);
             if (e.angle < 0) e.angle += TAU;
-            if (e.timer <= 0 && playerDist < 400 && playerDist > 30) {
+            float fireRange = aggroDist * 1.3f;
+            if (e.timer <= 0 && playerDist < fireRange && playerDist > 30) {
                 int bi = findFree();
                 if (bi >= 0) {
                     auto& b = ents[bi];
                     b.active = true; b.type = ENT_BULLET_W;
-                    b.pos = e.pos; b.vel = dir * 350.0f;
+                    b.pos = e.pos; b.vel = dir * cfg.warBulletSpeed;
                     b.timer = 1.5f; b.radius = 2; b.health = 1;
                     b.angle = e.angle;
                     soundTrigger = 6;
                 }
-                e.timer = 1.5f + (float)(rand() % 200) / 100.0f;
+                e.timer = fireCD_base + (float)(rand() % (int)(fireCD_rand * 100)) / 100.0f;
             }
             break;
         }
@@ -712,19 +699,21 @@ struct Game {
                 e.angle = atan2f(dir.y, dir.x);
                 if (e.angle < 0) e.angle += TAU;
                 if (e.timer <= 0 && bestDist < 100.0f) {
-                    if (rand() % 2 == 0) {
+                    if (rand() % 3 == 0) { // less trigger-happy when mining
                         int bi = findFree();
                         if (bi >= 0) {
                             auto& b = ents[bi];
                             b.active = true; b.type = ENT_BULLET_W;
-                            b.pos = e.pos; b.vel = dir * 350.0f;
+                            b.pos = e.pos; b.vel = dir * cfg.warBulletSpeed;
                             b.timer = 0.5f; b.radius = 2; b.health = 1;
                             b.angle = e.angle;
                         }
                     }
-                    e.timer = 0.8f + (float)(rand() % 100) / 100.0f;
+                    e.timer = 1.2f + (float)(rand() % 150) / 100.0f;
                 }
-                if (playerDist < 200.0f) { e.state = 1; e.timer2 = 3.0f; }
+                // Only interrupt mining to chase if player is VERY close
+                float mineInterruptDist = 60.0f + aggr * 80.0f; // 60-140px
+                if (playerDist < mineInterruptDist) { e.state = 1; e.timer2 = 3.0f; }
             } else {
                 e.state = 1;
             }
@@ -747,21 +736,22 @@ struct Game {
                 if (sp > speed * 0.7f) e.vel = e.vel * (speed * 0.7f / sp);
                 e.angle = atan2f(dir.y, dir.x);
                 if (e.angle < 0) e.angle += TAU;
-                if (playerDist < 300.0f) {
+                if (playerDist < aggroDist) {
                     Vec2 tp = wrapDelta(e.pos, player().pos).norm();
                     if (e.timer <= 0) {
                         int bi = findFree();
                         if (bi >= 0) {
                             auto& b = ents[bi];
                             b.active = true; b.type = ENT_BULLET_W;
-                            b.pos = e.pos; b.vel = tp * 350.0f;
+                            b.pos = e.pos; b.vel = tp * cfg.warBulletSpeed;
                             b.timer = 1.5f; b.radius = 2; b.health = 1;
                             b.angle = atan2f(tp.y, tp.x);
                             soundTrigger = 6;
                         }
-                        e.timer = 2.0f + (float)(rand() % 200) / 100.0f;
+                        e.timer = fireCD_base + (float)(rand() % (int)(fireCD_rand * 100)) / 100.0f;
                     }
-                    if (playerDist < 150.0f) { e.state = 1; e.timer2 = 3.0f; }
+                    float orbitInterruptDist = aggroDist * 0.5f;
+                    if (playerDist < orbitInterruptDist) { e.state = 1; e.timer2 = 3.0f; }
                 }
             } else {
                 e.state = 1;
@@ -773,10 +763,10 @@ struct Game {
 
     void updateWorker(Entity& e, float dt) {
         float speed = zone().wkrSpeed * diffMul();
-        if (speed > 250.0f) speed = 250.0f;
+        if (speed > cfg.wkrMaxSpeed) speed = cfg.wkrMaxSpeed;
 
         if (e.crystals > 0) {
-            float deliverSpeed = speed * 1.3f;
+            float deliverSpeed = speed * cfg.deliverSpeedMul;
             Entity* sini = findType(ENT_SINISTAR);
             if (sini) {
                 Vec2 dir = wrapDelta(e.pos, sini->pos).norm();
@@ -785,16 +775,23 @@ struct Game {
                 if (sp > deliverSpeed) e.vel = e.vel * (deliverSpeed / sp);
                 e.angle = atan2f(dir.y, dir.x);
                 if (e.angle < 0) e.angle += TAU;
-                if (wrapDist(e.pos, sini->pos) < 35) {
+                if (wrapDist(e.pos, sini->pos) < cfg.deliverDist) {
                     if (sinistarPieces < 13) {
-                        sinistarPieces++;
-                        if (sinistarPieces == 13) {
-                            sini->state = 1;
-                            siniInhibitor = 12; siniStun = 0;
-                            siniThinkAccum = 0;
-                            siniOrbitDir = (rand() % 2) ? 1.0f : -1.0f;
-                            showMessage("SINISTAR LIVES!", 3.0f);
-                            speechTrigger = 0; // "Beware, I live!"
+                        // ROM build threshold system ($4FAA): multiple deliveries needed per piece
+                        int level = std::min(zoneCycle(), 7);
+                        int threshold = cfg.buildThresholds[level];
+                        siniDeliveries++;
+                        if (siniDeliveries >= threshold) {
+                            siniDeliveries = 0;
+                            sinistarPieces++;
+                            if (sinistarPieces == 13) {
+                                sini->state = 1;
+                                siniInhibitor = cfg.inhibitorTicks; siniStun = 0;
+                                siniThinkAccum = 0;
+                                siniOrbitDir = (rand() % 2) ? 1.0f : -1.0f;
+                                showMessage("SINISTAR LIVES!", 3.0f);
+                                speechTrigger = 0; // "Beware, I live!"
+                            }
                         }
                     }
                     e.active = false;
@@ -807,7 +804,7 @@ struct Game {
                     c.active = true; c.type = ENT_CRYSTAL;
                     c.pos = e.pos;
                     c.vel = {(float)(rand()%40-20), (float)(rand()%40-20)};
-                    c.timer = 10.0f; c.radius = 3;
+                    c.timer = cfg.crystalTimer; c.radius = 3;
                 }
             }
         } else {
@@ -862,7 +859,7 @@ struct Game {
                 e.vel = e.vel + Vec2{cosf(a) * 30.0f, sinf(a) * 30.0f};
             }
             float sp = e.vel.len();
-            if (sp > 50.0f) e.vel = e.vel * (50.0f / sp);
+            if (sp > cfg.dormantMaxSpeed) e.vel = e.vel * (cfg.dormantMaxSpeed / sp);
             e.vel = e.vel * (1.0f - 0.3f * dt);
             e.angle += 0.15f * dt;
             if (e.angle > TAU) e.angle -= TAU;
@@ -874,11 +871,10 @@ struct Game {
             return;
         }
 
-        static const float THINK_DT = 16.0f / 60.0f;
         siniThinkAccum += dt;
 
-        while (siniThinkAccum >= THINK_DT) {
-            siniThinkAccum -= THINK_DT;
+        while (siniThinkAccum >= cfg.thinkInterval) {
+            siniThinkAccum -= cfg.thinkInterval;
             if (siniStun > 0) {
                 e.vel = e.vel * 0.5f;
                 siniStun--;
@@ -893,11 +889,11 @@ struct Game {
                 float sn = sinf(orbitAngle * siniOrbitDir);
                 Vec2 rotDelta = {delta.x * cs - delta.y * sn,
                                  delta.x * sn + delta.y * cs};
-                e.vel.x = siniAxisVel(e.vel.x, rotDelta.x, STBL_ORBIT, STBL_ORBIT_N, dm);
-                e.vel.y = siniAxisVel(e.vel.y, rotDelta.y, STBL_ORBIT, STBL_ORBIT_N, dm);
+                e.vel.x = siniAxisVel(e.vel.x, rotDelta.x, cfg.orbitTable, cfg.orbitTableN, dm);
+                e.vel.y = siniAxisVel(e.vel.y, rotDelta.y, cfg.orbitTable, cfg.orbitTableN, dm);
             } else {
-                e.vel.x = siniAxisVel(e.vel.x, delta.x, STBL_CHASE, STBL_CHASE_N, dm);
-                e.vel.y = siniAxisVel(e.vel.y, delta.y, STBL_CHASE, STBL_CHASE_N, dm);
+                e.vel.x = siniAxisVel(e.vel.x, delta.x, cfg.chaseTable, cfg.chaseTableN, dm);
+                e.vel.y = siniAxisVel(e.vel.y, delta.y, cfg.chaseTable, cfg.chaseTableN, dm);
             }
         }
 
@@ -929,7 +925,7 @@ struct Game {
         Entity* sini = findType(ENT_SINISTAR);
         if (sini) {
             Vec2 dir = wrapDelta(e.pos, sini->pos).norm();
-            float speed = 350.0f;
+            float speed = cfg.sinibombSpeed;
             e.vel = e.vel + dir * (speed * 4.0f * dt);
             float sp = e.vel.len();
             if (sp > speed) e.vel = e.vel * (speed / sp);
@@ -983,7 +979,7 @@ struct Game {
             if (target.type == ENT_WARRIOR || target.type == ENT_WORKER) {
                 spawnExplosion(target.pos, 5);
                 bullet.active = false;
-                score += target.type == ENT_WARRIOR ? PTS_WARRIOR : PTS_WORKER;
+                addScore(target.type == ENT_WARRIOR ? cfg.ptsWarrior : cfg.ptsWorker);
                 if (target.type == ENT_WORKER && target.crystals > 0) {
                     int ci = findFree();
                     if (ci >= 0) {
@@ -991,7 +987,7 @@ struct Game {
                         c.active = true; c.type = ENT_CRYSTAL;
                         c.pos = target.pos;
                         c.vel = {(float)(rand()%40-20), (float)(rand()%40-20)};
-                        c.timer = 10.0f; c.radius = 3;
+                        c.timer = cfg.crystalTimer; c.radius = 3;
                     }
                 }
                 target.active = false;
@@ -1026,36 +1022,36 @@ struct Game {
             bomb.active = false;
             spawnExplosion(bomb.pos, 8);
             sinistarPieces--;
-            siniStun += 2;
-            score += PTS_SINI_PIECE;
+            siniStun += cfg.stunPerBomb;
+            addScore(cfg.ptsSiniPiece);
             if (sinistarPieces <= 0) {
                 // KABOOM — Sinistar destroyed
                 spawnExplosion(sini.pos, 20);
                 sini.active = false;
-                score += PTS_SINISTAR;
+                addScore(cfg.ptsSinistar);
                 sinistarKills++;
                 soundTrigger = 5;
                 // Transition to explosion sequence
                 gameState = GS_SINI_EXPLODE;
-                stateTimer = 3.0f; // ~180 frames
-                flashTimer = 2.0f; // SNXBFT: background flash for ~2s (45 frame cycles)
+                stateTimer = cfg.siniExplodeTime;
+                flashTimer = cfg.siniFlashTime;
                 showMessage("SINISTAR DESTROYED!", 3.0f);
             } else {
                 if (sinistarPieces < 13 && sini.state == 1) {
                     sini.state = 0;
-                    siniInhibitor = 12;
+                    siniInhibitor = cfg.inhibitorTicks;
                 }
                 soundTrigger = 5;
             }
         }
-        // Player vs crystal — 200 pts from ROM ($0200 at $F677) + sinibomb conversion
+        // Player vs crystal — 200 pts from ROM ($0200 BCD at $EF6A) + sinibomb conversion
         else if ((a.type == ENT_PLAYER && b.type == ENT_CRYSTAL) ||
                  (b.type == ENT_PLAYER && a.type == ENT_CRYSTAL)) {
             Entity& crys = a.type == ENT_CRYSTAL ? a : b;
             crys.active = false;
-            score += PTS_CRYSTAL;
+            addScore(cfg.ptsCrystal);
             sinibombs++;
-            if (sinibombs > 20) sinibombs = 20;
+            if (sinibombs > cfg.maxSinibombs) sinibombs = cfg.maxSinibombs;
             soundTrigger = 3;
         }
         else if ((a.type == ENT_WORKER && b.type == ENT_CRYSTAL) ||
@@ -1107,13 +1103,14 @@ struct Game {
     void killPlayer() {
         if (!player().active) return;
         if (gameState != GS_PLAYING) return; // can't die outside gameplay
-        spawnExplosion(player().pos, 10);
+        // Original DEATH.ASM: dramatic multi-fragment explosion lingers 2-3 seconds
+        spawnPlayerExplosion(player().pos);
         player().active = false;
         lives--;
         soundTrigger = 2;
         gameState = GS_DEATH;
-        stateTimer = 2.0f; // 120 frames from ROM
-        flashTimer = 0.3f; // brief white flash
+        stateTimer = cfg.deathTime;
+        flashTimer = cfg.deathFlashTime;
     }
 
     void spawnExplosion(Vec2 pos, int count) {
@@ -1126,6 +1123,35 @@ struct Game {
             float sp = 50.0f + (float)(rand() % 150);
             e.vel = {cosf(a) * sp, sinf(a) * sp};
             e.timer = 0.3f + (float)(rand() % 50) / 100.0f;
+            e.radius = 1; e.subtype = rand() % 4;
+        }
+        soundTrigger = 1;
+    }
+
+    // Original DEATH.ASM: player ship breaks into fragments that spread wide and linger
+    void spawnPlayerExplosion(Vec2 pos) {
+        // Large bright fragments (ship pieces) - slow, long-lived
+        for (int i = 0; i < 8; i++) {
+            int idx = findFree(); if (idx < 0) return;
+            auto& e = ents[idx];
+            e.active = true; e.type = ENT_EXPLOSION;
+            e.pos = pos;
+            float a = (float)(rand() % 628) / 100.0f;
+            float sp = 30.0f + (float)(rand() % 80);
+            e.vel = {cosf(a) * sp, sinf(a) * sp};
+            e.timer = 1.5f + (float)(rand() % 150) / 100.0f; // 1.5-3.0s
+            e.radius = 2; e.subtype = rand() % 2; // bright colors
+        }
+        // Fast sparks/debris - quick scatter
+        for (int i = 0; i < 15; i++) {
+            int idx = findFree(); if (idx < 0) return;
+            auto& e = ents[idx];
+            e.active = true; e.type = ENT_EXPLOSION;
+            e.pos = pos;
+            float a = (float)(rand() % 628) / 100.0f;
+            float sp = 80.0f + (float)(rand() % 200);
+            e.vel = {cosf(a) * sp, sinf(a) * sp};
+            e.timer = 0.5f + (float)(rand() % 80) / 100.0f; // 0.5-1.3s
             e.radius = 1; e.subtype = rand() % 4;
         }
         soundTrigger = 1;
@@ -1145,7 +1171,7 @@ struct Game {
                 float sp = 30.0f + (float)(rand() % 40);
                 c.pos = plan.pos + Vec2{cosf(a)*12, sinf(a)*12};
                 c.vel = {cosf(a)*sp, sinf(a)*sp};
-                c.timer = 10.0f; c.radius = 3;
+                c.timer = cfg.crystalTimer; c.radius = 3;
             }
             plan.timer2 -= 8.0f;
             if (plan.timer2 < 0) plan.timer2 = 0;
@@ -1162,7 +1188,7 @@ struct Game {
                     float sp = 40.0f + (float)(rand() % 80);
                     c.pos = plan.pos + Vec2{cosf(a)*8, sinf(a)*8};
                     c.vel = {cosf(a)*sp, sinf(a)*sp};
-                    c.timer = 10.0f; c.radius = 3;
+                    c.timer = cfg.crystalTimer; c.radius = 3;
                 }
             }
             spawnExplosion(plan.pos, 8);
