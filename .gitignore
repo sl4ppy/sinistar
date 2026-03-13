@@ -1,0 +1,19 @@
+# Build artifacts
+sinistar
+*.o
+
+# ROM files (copyrighted, not distributable)
+source/
+
+# Screenshots
+*.png
+*.ppm
+
+# Editor/IDE
+.vscode/
+*.swp
+*~
+
+# Claude Code
+.claude/
+memory/
